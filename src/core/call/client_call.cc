@@ -42,6 +42,7 @@
 #include "src/core/call/metadata.h"
 #include "src/core/lib/event_engine/event_engine_context.h"
 #include "src/core/lib/promise/all_ok.h"
+#include "src/core/lib/promise/cancel_callback.h"
 #include "src/core/lib/promise/status_flag.h"
 #include "src/core/lib/promise/try_seq.h"
 #include "src/core/lib/resource_quota/arena.h"
@@ -62,7 +63,9 @@ namespace grpc_core {
 
 namespace {
 
-grpc_call_error ValidateClientBatch(const grpc_op* ops, size_t nops) {
+grpc_call_error ValidateClientBatch(
+    const grpc_op* ops, size_t nops,
+    CallOpInvariantsValidator& call_op_invariants_validator) {
   BitSet<8> got_ops;
   for (size_t op_idx = 0; op_idx < nops; op_idx++) {
     const grpc_op& op = ops[op_idx];
@@ -91,10 +94,12 @@ grpc_call_error ValidateClientBatch(const grpc_op* ops, size_t nops) {
       case GRPC_OP_SEND_STATUS_FROM_SERVER:
         return GRPC_CALL_ERROR_NOT_ON_CLIENT;
     }
-    if (got_ops.is_set(op.op)) return GRPC_CALL_ERROR_TOO_MANY_OPERATIONS;
-    got_ops.set(op.op);
+    if (!IsCallv3BatchValidationEnabled()) {
+      if (got_ops.is_set(op.op)) return GRPC_CALL_ERROR_TOO_MANY_OPERATIONS;
+      got_ops.set(op.op);
+    }
   }
-  return GRPC_CALL_OK;
+  return call_op_invariants_validator.ValidateAndCommit(ops, nops);
 }
 
 }  // namespace
@@ -161,7 +166,8 @@ grpc_call_error ClientCall::StartBatch(const grpc_op* ops, size_t nops,
     EndOpImmediately(cq_, notify_tag, is_notify_tag_closure);
     return GRPC_CALL_OK;
   }
-  const grpc_call_error validation_result = ValidateClientBatch(ops, nops);
+  const grpc_call_error validation_result =
+      ValidateClientBatch(ops, nops, call_op_invariants_validator_);
   if (validation_result != GRPC_CALL_OK) {
     return validation_result;
   }
@@ -257,7 +263,7 @@ Party::WakeupHold ClientCall::StartCall(
     const grpc_op& send_initial_metadata_op) {
   GRPC_LATENT_SEE_SCOPE("ClientCall::StartCall");
   auto cur_state = call_state_.load(std::memory_order_acquire);
-  // TODO(akshitpatel): [PH2][P1]: Might need to invoke
+  // TODO(akshitpatel): [PH2][P3]: Might need to invoke
   // PrepareApplicationMetadata here.
   CToMetadata(send_initial_metadata_op.data.send_initial_metadata.metadata,
               send_initial_metadata_op.data.send_initial_metadata.count,
@@ -332,9 +338,18 @@ void ClientCall::CommitBatch(const grpc_op* ops, size_t nops, void* notify_tag,
             &op.data.send_message.send_message->data.raw.slice_buffer,
             send.c_slice_buffer());
         auto msg = arena()->MakePooled<Message>(std::move(send), op.flags);
-        return [this, msg = std::move(msg)]() mutable {
-          return started_call_initiator_.PushMessage(std::move(msg));
-        };
+        return OnCancelFactory(
+            [this, msg = std::move(msg)]() mutable {
+              return Map(
+                  started_call_initiator_.PushMessage(std::move(msg)),
+                  [guard = ConcurrentOpGuard(&call_op_invariants_validator_,
+                                             GRPC_OP_SEND_MESSAGE)](
+                      StatusFlag result) { return result; });
+            },
+            [this]() {
+              call_op_invariants_validator_.ResetConcurrentOp(
+                  GRPC_OP_SEND_MESSAGE);
+            });
       });
   auto send_close_from_client =
       op_index.OpHandler<GRPC_OP_SEND_CLOSE_FROM_CLIENT>(
@@ -346,7 +361,23 @@ void ClientCall::CommitBatch(const grpc_op* ops, size_t nops, void* notify_tag,
           });
   auto recv_message =
       op_index.OpHandler<GRPC_OP_RECV_MESSAGE>([this](const grpc_op& op) {
-        return message_receiver_.MakeBatchOp(op, &started_call_initiator_);
+        auto recv_message_promise_factory =
+            message_receiver_.MakeBatchOp(op, &started_call_initiator_);
+        // Validator is guaranteed to outlive the ConcurrentOpGuard because of
+        // weak ref to the call taken by the PrimaryOps promise.
+        return OnCancelFactory(
+            [this, recv_message_promise_factory =
+                       std::move(recv_message_promise_factory)]() mutable {
+              return Map(
+                  recv_message_promise_factory(),
+                  [guard = ConcurrentOpGuard(&call_op_invariants_validator_,
+                                             GRPC_OP_RECV_MESSAGE)](
+                      StatusFlag result) { return result; });
+            },
+            [this]() {
+              call_op_invariants_validator_.ResetConcurrentOp(
+                  GRPC_OP_RECV_MESSAGE);
+            });
       });
   auto recv_initial_metadata =
       op_index.OpHandler<GRPC_OP_RECV_INITIAL_METADATA>([this](
