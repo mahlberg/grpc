@@ -124,6 +124,8 @@ TransportFlowControl::TransportFlowControl(absl::string_view peer_name,
                                            MemoryOwner* memory_owner)
     : memory_owner_(memory_owner),
       enable_bdp_probe_(enable_bdp_probe),
+      bdp_ping_blocked_(true),
+      bdp_ping_started_(false),
       bdp_estimator_(peer_name) {}
 
 uint32_t TransportFlowControl::DesiredAnnounceSize(bool writing_anyway) const {
@@ -289,6 +291,7 @@ FlowControlAction TransportFlowControl::SetAckedInitialWindow(uint32_t value) {
 FlowControlAction TransportFlowControl::PeriodicUpdate() {
   FlowControlAction action;
   if (enable_bdp_probe_) {
+    GRPC_HTTP2_FLOW_CONTROL_DLOG << "TransportFlowControl::PeriodicUpdate";
     // get bdp estimate and update initial_window accordingly.
     // target might change based on how much memory pressure we are under
     // TODO(ncteisen): experiment with setting target to be huge under low

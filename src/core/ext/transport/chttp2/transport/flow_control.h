@@ -24,6 +24,7 @@
 #include <stdint.h>
 
 #include <algorithm>
+#include <cstddef>
 #include <iosfwd>
 #include <optional>
 #include <string>
@@ -56,10 +57,6 @@ static constexpr const uint32_t kMaxInitialWindowSize = (1u << 30);
 // The maximum per-stream flow control window delta to advertise.
 static constexpr const int64_t kMaxWindowDelta = (1u << 20);
 static constexpr const int kDefaultPreferredRxCryptoFrameSize = INT_MAX;
-
-// TODO(tjagtap) [PH2][P2][BDP] Remove this static sleep when the BDP code is
-// done. This needs to be dynamic.
-constexpr Duration kFlowControlPeriodicUpdateTimer = Duration::Seconds(8);
 
 class TransportFlowControl;
 class StreamFlowControl;
@@ -418,6 +415,91 @@ class TransportFlowControl final {
   }
   size_t window_update_list_size() const { return window_update_list_.size(); }
 
+  //////////////////////////////////////////////////////////////////////////////
+  // BDP Ping related functions.
+
+  // The current implementation of BDP relies on the assumption that our
+  // transport will not send out a new ping till it has received an ACK for the
+  // previous ping.
+
+  // CHTTP2 reference : schedule_bdp_ping_locked
+  void ScheduleBdpPing() {
+    do_not_submit_ever_++;
+    GRPC_CHECK(do_not_submit_ever_ <= 10);
+    GRPC_HTTP2_FLOW_CONTROL_DLOG << "TransportFlowControl::ScheduleBdpPing";
+    GRPC_DCHECK(enable_bdp_probe_);
+    GRPC_DCHECK(!IsBdpPingStarted());
+    if (!IsBdpPingStarted()) {
+      bdp_estimator_.SchedulePing();
+    }
+  }
+
+  bool IsBdpPingStarted() const { return bdp_ping_started_; }
+
+  // CHTTP2 reference : start_bdp_ping_locked
+  void StartBdpPing() {
+    do_not_submit_ever_++;
+    GRPC_CHECK(do_not_submit_ever_ <= 10);
+    GRPC_HTTP2_FLOW_CONTROL_DLOG << "TransportFlowControl::StartBdpPing";
+    // TODO(tjagtap) : [PH2][P1] : Reset the keepalive ping timer
+    bdp_ping_started_ = true;
+    bdp_estimator_.StartPing();
+  }
+
+  // CHTTP2 reference : finish_bdp_ping_locked
+  Duration CompleteBdpPing() {
+    do_not_submit_ever_++;
+    GRPC_CHECK(do_not_submit_ever_ <= 10);
+    GRPC_HTTP2_FLOW_CONTROL_DLOG << "TransportFlowControl::CompleteBdpPing";
+    GRPC_DCHECK(bdp_ping_started_);
+    bdp_ping_started_ = false;
+    return bdp_estimator_.CompletePing() - grpc_core::Timestamp::Now();
+  }
+
+  // CHTTP2 reference : init_data_frame_parser
+  bool OnReceiveDataFrame(const uint32_t bytes) {
+    GRPC_HTTP2_FLOW_CONTROL_DLOG << "TransportFlowControl::OnReceiveDataFrame";
+    if (enable_bdp_probe_) {
+      bdp_estimator_.AddIncomingBytes(bytes);
+      if (bdp_ping_blocked_ && (bytes > 0)) {
+        // Once we receive a data frame, we can start sending BDP pings again.
+        bdp_ping_blocked_ = false;
+        if (bdp_waker_ != Waker()) {
+          bdp_waker_.Wakeup();
+        }
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // CHTTP2 reference : grpc_chttp2_transport::bdp_ping_blocked
+  bool IsBdpPingBlocked() const { return bdp_ping_blocked_; }
+
+  auto WaitForBdpActivation() {
+    GRPC_HTTP2_FLOW_CONTROL_DLOG
+        << "TransportFlowControl::WaitForBdpActivation Factory";
+    return [this]() -> Poll<absl::Status> {
+      do_not_submit_ever_++;
+      GRPC_CHECK(do_not_submit_ever_ <= 10);
+      GRPC_HTTP2_FLOW_CONTROL_DLOG
+          << "TransportFlowControl::WaitForBdpActivation Promise";
+      GRPC_DCHECK(enable_bdp_probe_);
+      GRPC_DCHECK(!bdp_ping_started_);
+      if (bdp_estimator_.accumulator() == 0) {
+        // Block BDP ping till we receive data in a DATA frame on the transport.
+        bdp_ping_blocked_ = true;
+      }
+      if (bdp_ping_blocked_) {
+        bdp_waker_ = GetContext<Activity>()->MakeNonOwningWaker();
+        return Pending{};
+      }
+      GRPC_HTTP2_FLOW_CONTROL_DLOG
+          << "TransportFlowControl::WaitForBdpActivation Resolved";
+      return absl::OkStatus();
+    };
+  }
+
  private:
   friend class StreamFlowControl;
 
@@ -461,12 +543,17 @@ class TransportFlowControl final {
   /// incoming_window = total_over - max(bdp - total_under, 0)
   int64_t announced_stream_total_over_incoming_window_ = 0;
 
-  /// should we probe bdp?
+  //  Transport level channel argument GRPC_ARG_HTTP2_BDP_PROBE decides if we
+  //  should probe for bdp.
   const bool enable_bdp_probe_;
-
-  // bdp estimation
+  // CHTTP2 reference : grpc_chttp2_transport::bdp_ping_blocked
+  bool bdp_ping_blocked_;
+  // CHTTP2 reference : grpc_chttp2_transport::bdp_ping_started
+  bool bdp_ping_started_;
+  Waker bdp_waker_;
   BdpEstimator bdp_estimator_;
 
+  uint64_t do_not_submit_ever_ = 0u;
   int64_t remote_window_ = kDefaultWindow;
   int64_t target_initial_window_size_ = kDefaultWindow;
   int64_t target_frame_size_ = kDefaultFrameSize;

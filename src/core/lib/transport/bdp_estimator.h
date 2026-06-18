@@ -35,7 +35,8 @@
 namespace grpc_core {
 
 constexpr int64_t kInitialBdpDefault = 65536;
-constexpr uint32_t kDefaultInterPingDelayMillis = 100;
+// DO NOT SUBMIT DIFF. ONLY FOR TESTING.
+constexpr uint32_t kDefaultInterPingDelayMillis = 10;
 constexpr uint32_t kMaxInterPingDelaySeconds = 10;
 
 class BdpEstimator {
