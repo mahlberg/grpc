@@ -331,7 +331,7 @@ class Http2ClientTransport final : public ClientTransport,
                                             Poll<absl::Status>>,
                              bool> = true>
   auto UntilTransportClosed(Promise&& promise) {
-    return Race(Map(transport_closed_latch_.Wait(),
+    return Race(Map(shutdown_tracker_.WaitShutdownComplete(),
                     [self = RefAsSubclass<Http2ClientTransport>()](Empty) {
                       GRPC_HTTP2_CLIENT_DLOG << "Transport closed";
                       return absl::CancelledError("Transport closed");
@@ -344,7 +344,7 @@ class Http2ClientTransport final : public ClientTransport,
                                             Poll<Empty>>,
                              bool> = true>
   auto UntilTransportClosed(Promise&& promise) {
-    return Race(Map(transport_closed_latch_.Wait(),
+    return Race(Map(shutdown_tracker_.WaitShutdownComplete(),
                     [self = RefAsSubclass<Http2ClientTransport>()](Empty) {
                       GRPC_HTTP2_CLIENT_DLOG << "Transport closed";
                       return Empty{};
@@ -557,6 +557,14 @@ class Http2ClientTransport final : public ClientTransport,
   void MaybeSpawnCloseTransport(Http2Status http2_status,
                                 DebugLocation whence = {});
 
+  auto CloseTransportFactory(
+      absl::flat_hash_map<uint32_t, RefCountedPtr<Stream>> stream_list,
+      Http2Status http2_status, DebugLocation whence = {});
+
+  void CloseAllActiveStreams(
+      absl::flat_hash_map<uint32_t, RefCountedPtr<Stream>>&& stream_list,
+      const Http2Status& http2_status, DebugLocation whence);
+
   // This function MUST run on the transport party.
   void CloseTransport();
 
@@ -665,6 +673,40 @@ class Http2ClientTransport final : public ClientTransport,
     Http2ClientTransport* transport_;
   };
 
+  class WritableStreamWrapper {
+   public:
+    explicit WritableStreamWrapper(RefCountedPtr<Stream> s)
+        : stream(std::move(s)) {}
+
+    // WritableStreamWrapper is only movable constructible.
+    WritableStreamWrapper(WritableStreamWrapper&& other)
+        : stream(std::exchange(other.stream, nullptr)) {}
+
+    WritableStreamWrapper(const WritableStreamWrapper&) = delete;
+    WritableStreamWrapper& operator=(const WritableStreamWrapper&) = delete;
+    WritableStreamWrapper& operator=(WritableStreamWrapper&& other) = delete;
+
+    ~WritableStreamWrapper() { MaybeCancel(); }
+
+    Stream* operator->() const { return stream.get(); }
+    Stream* get() const { return stream.get(); }
+    Stream& operator*() const { return *stream; }
+
+    RefCountedPtr<Stream> TakeStream() { return std::move(stream); }
+
+   private:
+    void MaybeCancel() {
+      // Here we may call CancelCall on a stream that is already initialized.
+      // This is fine as CancelCall is idempotent and it would already be
+      // cancelled by the CloseTransport promise.
+      if (stream != nullptr) {
+        stream->CancelCall(absl::UnavailableError("Transport closed"));
+      }
+    }
+
+    RefCountedPtr<Stream> stream;
+  };
+
   //////////////////////////////////////////////////////////////////////////////
   // All Data Members
 
@@ -681,8 +723,7 @@ class Http2ClientTransport final : public ClientTransport,
 
   uint32_t next_stream_id_;
   HPackCompressor encoder_;
-  bool is_transport_closed_ ABSL_GUARDED_BY(transport_mutex_) = false;
-  Latch<void> transport_closed_latch_;
+  TransportShutdownTracker shutdown_tracker_;
 
   ConnectivityStateTracker state_tracker_ ABSL_GUARDED_BY(transport_mutex_){
       "http2_client", GRPC_CHANNEL_READY};
@@ -712,7 +753,7 @@ class Http2ClientTransport final : public ClientTransport,
 
   MemoryOwner memory_owner_;
   chttp2::TransportFlowControl flow_control_;
-  WritableStreams<RefCountedPtr<Stream>> writable_stream_list_;
+  WritableStreams<WritableStreamWrapper> writable_stream_list_;
 
   RefCountedPtr<SecurityFrameHandler> security_frame_handler_;
   std::shared_ptr<PromiseHttp2ZTraceCollector> ztrace_collector_;
